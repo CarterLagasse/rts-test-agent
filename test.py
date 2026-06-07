@@ -1,6 +1,7 @@
 """
-High-Performance Heuristic Agent for MicroRTS-Py
-=================================================
+High-Performance Heuristic Agent for MicroRTS-Py  (v2 - fixed)
+===============================================================
+
 Observation space: (num_envs, H, W, 29) one-hot planes
   [0:5]   HP         (0,1,2,3,>=4)
   [5:10]  Resources  (0,1,2,3,>=4)
@@ -9,98 +10,62 @@ Observation space: (num_envs, H, W, 29) one-hot planes
   [21:27] CurAction  (none,move,harvest,return,produce,attack)
   [27:29] Terrain    (free, wall)
 
-Action mask per cell: 78 bits
+Action mask per cell: 78 bits split as:
   [0:6]   action type  (NOOP,move,harvest,return,produce,attack)
   [6:10]  move dir     (N,E,S,W)
   [10:14] harvest dir  (N,E,S,W)
   [14:18] return dir   (N,E,S,W)
   [18:22] produce dir  (N,E,S,W)
   [22:29] produce type (resource,base,barrack,worker,light,heavy,ranged)
-  [29:78] attack target (7x7 relative grid)
+  [29:78] attack target (7x7 relative grid, flat-indexed)
 
-Strategy:
-  Phase 1 – Economy bootstrap
-    * Worker → harvest mineral → return to base (loop)
-    * Base produces a 2nd worker when resources allow
-  Phase 2 – Military build-up  (resources >= 2)
-    * Build barracks if none exist
-    * Barracks produce light units
-  Phase 3 – Attack
-    * Combat units (light/heavy/ranged) seek the nearest enemy
-    * Idle workers without harvest duty attack-move toward enemies
-  Special:
-    * Ranged units prefer to attack-move from distance
-    * If we have barracks and enough resources, produce heavy/ranged mix
-    * Unused bases occasionally produce more workers
+Output action vector per cell (7 values):
+  [0] action_type   [1] move_dir   [2] harvest_dir   [3] return_dir
+  [4] produce_dir   [5] produce_type   [6] attack_flat_idx
+
+KEY RULES (discovered by studying the codebase):
+  - BASES produce workers
+  - WORKERS build barracks (by producing into adjacent empty cell)
+  - BARRACKS produce combat units (light, heavy, ranged)
+  - Units currently mid-action have only NOOP valid in the mask
+  - The env's source_unit_mask filters which cells actually execute actions
+
+STRATEGY:
+  Phase 1 (always): Base produces workers; one worker harvests, one builds barracks
+  Phase 2: Barracks produce light+ranged mix; workers continue harvesting
+  Phase 3: All combat units attack-move toward nearest enemy
+  Emergency: If enemies reach our base, workers join the attack
 """
 
 import numpy as np
-from typing import Tuple
 
 # ──────────────────────────────────────────────────────────────
-# Observation plane offsets (one-hot)
+# Observation plane offsets
 # ──────────────────────────────────────────────────────────────
-HP_START       = 0
-RES_START      = 5
-OWNER_START    = 10
-UTYPE_START    = 13
-ACTION_START   = 21
-TERRAIN_START  = 27
+HP_START      = 0
+RES_START     = 5
+OWNER_START   = 10
+UTYPE_START   = 13
+ACTION_START  = 21
+TERRAIN_START = 27
 
-# Owner indices (relative to OWNER_START)
-OWNER_NONE  = 0
-OWNER_P1    = 1
-OWNER_P2    = 2
+OWNER_NONE, OWNER_P1, OWNER_P2 = 0, 1, 2
 
 # Unit type indices (relative to UTYPE_START)
-UT_NONE     = 0
-UT_RESOURCE = 1
-UT_BASE     = 2
-UT_BARRACK  = 3
-UT_WORKER   = 4
-UT_LIGHT    = 5
-UT_HEAVY    = 6
-UT_RANGED   = 7
+UT_NONE, UT_RESOURCE, UT_BASE, UT_BARRACK = 0, 1, 2, 3
+UT_WORKER, UT_LIGHT, UT_HEAVY, UT_RANGED  = 4, 5, 6, 7
 
-# Current-action indices (relative to ACTION_START)
-CA_NONE     = 0
-CA_MOVE     = 1
-CA_HARVEST  = 2
-CA_RETURN   = 3
-CA_PRODUCE  = 4
-CA_ATTACK   = 5
+# Action type indices
+ACT_NOOP, ACT_MOVE, ACT_HARVEST, ACT_RETURN, ACT_PRODUCE, ACT_ATTACK = 0,1,2,3,4,5
 
-# Action-type indices (in the output action vector)
-ACT_NOOP    = 0
-ACT_MOVE    = 1
-ACT_HARVEST = 2
-ACT_RETURN  = 3
-ACT_PRODUCE = 4
-ACT_ATTACK  = 5
-
-# Direction constants (N=0, E=1, S=2, W=3)
+# Direction constants
 DIR_N, DIR_E, DIR_S, DIR_W = 0, 1, 2, 3
 
-# Produce-type constants (index into [22:29] of mask)
-PT_RESOURCE = 0
-PT_BASE     = 1
-PT_BARRACK  = 2
-PT_WORKER   = 3
-PT_LIGHT    = 4
-PT_HEAVY    = 5
-PT_RANGED   = 6
+# Produce-type indices in mask [22:29]
+PT_RESOURCE, PT_BASE, PT_BARRACK, PT_WORKER = 0, 1, 2, 3
+PT_LIGHT, PT_HEAVY, PT_RANGED               = 4, 5, 6
 
-# Direction deltas: (dy, dx)  [row, col] = [y, x]
-DIR_DELTA = {
-    DIR_N: (-1,  0),
-    DIR_E: ( 0,  1),
-    DIR_S: ( 1,  0),
-    DIR_W: ( 0, -1),
-}
-
-# ──────────────────────────────────────────────────────────────
-# Mask group slices (within the 78-bit action mask per cell)
-# ──────────────────────────────────────────────────────────────
+# Mask slices
 MASK_ACT   = slice(0,  6)
 MASK_MOVE  = slice(6,  10)
 MASK_HARV  = slice(10, 14)
@@ -109,337 +74,351 @@ MASK_PROD  = slice(18, 22)
 MASK_PTYPE = slice(22, 29)
 MASK_ATK   = slice(29, 78)
 
-ATK_SIZE   = 7  # 7x7 attack grid
-ATK_CENTER = 3  # center index of 7x7
-
+ATK_SIZE   = 7
+ATK_CENTER = 3
 
 # ──────────────────────────────────────────────────────────────
-# Helpers
+# Cell-level helpers
 # ──────────────────────────────────────────────────────────────
 
-def _plane(obs_cell: np.ndarray, start: int) -> int:
-    """Return the active index within a one-hot block starting at `start`."""
-    # obs_cell shape: (29,)
-    block = obs_cell[start: start + 8]  # generous upper bound
-    idx = block.argmax()
-    return int(idx)
+def _argmax_block(cell, start, length):
+    return int(cell[start: start + length].argmax())
 
+def _owner(cell):  return _argmax_block(cell, OWNER_START, 3)
+def _utype(cell):  return _argmax_block(cell, UTYPE_START, 8)
+def _res(cell):    return _argmax_block(cell, RES_START,   5)  # bucket 0-4
 
-def _owner(obs_cell: np.ndarray) -> int:
-    return _plane(obs_cell, OWNER_START)
-
-
-def _utype(obs_cell: np.ndarray) -> int:
-    return _plane(obs_cell, UTYPE_START)
-
-
-def _cur_action(obs_cell: np.ndarray) -> int:
-    return _plane(obs_cell, ACTION_START)
-
-
-def _resources(obs_cell: np.ndarray) -> int:
-    """Estimated resource count (returns bucket index 0-4)."""
-    return int(obs_cell[RES_START: RES_START + 5].argmax())
-
-
-def _hp(obs_cell: np.ndarray) -> int:
-    return int(obs_cell[HP_START: HP_START + 5].argmax())
-
-
-def _is_wall(obs_cell: np.ndarray) -> bool:
-    return bool(obs_cell[TERRAIN_START + 1] == 1)
-
-
-def _l1(r1, c1, r2, c2) -> int:
+def _l1(r1, c1, r2, c2):
     return abs(r1 - r2) + abs(c1 - c2)
 
-
-def _dir_toward(r_src, c_src, r_dst, c_dst) -> int:
-    """Cardinal direction from (r_src,c_src) toward (r_dst,c_dst)."""
-    dr = r_dst - r_src
-    dc = c_dst - c_src
+def _dir_toward(r_src, c_src, r_dst, c_dst):
+    dr, dc = r_dst - r_src, c_dst - c_src
     if abs(dr) >= abs(dc):
         return DIR_S if dr > 0 else DIR_N
-    else:
-        return DIR_E if dc > 0 else DIR_W
+    return DIR_E if dc > 0 else DIR_W
 
-
-def _best_valid_dir(mask_4: np.ndarray, preferred: int) -> int:
-    """Return preferred direction if valid, else any valid direction."""
-    if mask_4[preferred]:
+def _first_valid_dir(mask4, preferred):
+    if mask4[preferred]:
         return preferred
     for d in range(4):
-        if mask_4[d]:
+        if mask4[d]:
             return d
-    return 0  # fallback (shouldn't happen if action type is valid)
+    return 0
 
+def _noop():
+    return np.array([ACT_NOOP, 0, 0, 0, 0, 0, 0], dtype=np.int32)
 
-def _best_attack_target(atk_mask: np.ndarray, r_src, c_src,
-                         enemy_positions, H, W) -> int:
+def _make_move(d):
+    return np.array([ACT_MOVE, d, 0, 0, 0, 0, 0], dtype=np.int32)
+
+def _make_harvest(d):
+    return np.array([ACT_HARVEST, 0, d, 0, 0, 0, 0], dtype=np.int32)
+
+def _make_return(d):
+    return np.array([ACT_RETURN, 0, 0, d, 0, 0, 0], dtype=np.int32)
+
+def _make_produce(d, ptype):
+    return np.array([ACT_PRODUCE, 0, 0, 0, d, ptype, 0], dtype=np.int32)
+
+def _make_attack(flat_idx):
+    return np.array([ACT_ATTACK, 0, 0, 0, 0, 0, flat_idx], dtype=np.int32)
+
+# ──────────────────────────────────────────────────────────────
+# Navigation helpers
+# ──────────────────────────────────────────────────────────────
+
+def _move_toward(r, c, tr, tc, move_mask):
+    """Return move action toward target, or None if can't move."""
+    if not move_mask.any():
+        return None
+    pref = _dir_toward(r, c, tr, tc)
+    d = _first_valid_dir(move_mask, pref)
+    return _make_move(d)
+
+def _best_attack(atk_mask, r, c, enemy_positions):
     """
-    Choose the best attack target index (0-48) from the 7x7 relative grid.
-    Prefers enemies that are in the mask; falls back to any valid bit.
+    Pick the best attack target from the 7x7 flat grid.
+    Prefers low-HP enemies (harv/worker > base > combat), else first valid bit.
     """
-    # Map enemy positions to relative attack offsets
-    best_idx = -1
-    best_priority = -1
+    best_flat = -1
+    best_dist = 9999
     for (er, ec) in enemy_positions:
-        dr = er - r_src + ATK_CENTER
-        dc = ec - c_src + ATK_CENTER
+        dr = er - r + ATK_CENTER
+        dc = ec - c + ATK_CENTER
         if 0 <= dr < ATK_SIZE and 0 <= dc < ATK_SIZE:
             flat = dr * ATK_SIZE + dc
             if atk_mask[flat]:
-                priority = 0  # prefer weaker enemies (lower HP bucket handled by unit type)
-                if priority > best_priority:
-                    best_priority = priority
-                    best_idx = flat
-    if best_idx >= 0:
-        return best_idx
+                dist = _l1(r, c, er, ec)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_flat = flat
+    if best_flat >= 0:
+        return best_flat
     # fallback: first valid bit
-    for i in range(ATK_SIZE * ATK_SIZE):
-        if atk_mask[i]:
-            return i
-    return 0
+    valid = np.where(atk_mask)[0]
+    return int(valid[0]) if len(valid) else 0
 
+def _attack_or_move(r, c, mask78, enemy_positions):
+    """Try attack first, then move toward nearest enemy."""
+    atk_mask  = mask78[MASK_ATK]
+    move_mask = mask78[MASK_MOVE]
+    act_mask  = mask78[MASK_ACT]
 
-def _masked_softmax_sample(logits_or_mask: np.ndarray) -> int:
-    """Sample from valid (1) entries proportionally (uniform among valid)."""
-    valid = np.where(logits_or_mask > 0)[0]
-    if len(valid) == 0:
-        return 0
-    return int(np.random.choice(valid))
+    if act_mask[ACT_ATTACK] and atk_mask.any() and enemy_positions:
+        flat = _best_attack(atk_mask, r, c, enemy_positions)
+        return _make_attack(flat)
 
+    if act_mask[ACT_MOVE] and move_mask.any() and enemy_positions:
+        nearest = min(enemy_positions, key=lambda ep: _l1(r, c, ep[0], ep[1]))
+        mv = _move_toward(r, c, nearest[0], nearest[1], move_mask)
+        if mv is not None:
+            return mv
+
+    return None
 
 # ──────────────────────────────────────────────────────────────
-# Per-environment state tracking (lightweight, reset each call
-# since we can reconstruct everything from obs)
+# Environment parser
 # ──────────────────────────────────────────────────────────────
 
-def _parse_env(obs: np.ndarray) -> dict:
-    """
-    Parse one environment's observation (H, W, 29) into useful structures.
-    Returns:
-      - p1_units:  list of (r,c,utype) for player 1
-      - p2_units:  list of (r,c,utype) for player 2
-      - resources: list of (r,c) for mineral nodes
-      - p1_resources_on_map: estimated total resources carried by p1 units
-    """
+def _parse_env(obs):
+    """Parse one env's (H, W, 29) observation into a summary dict."""
     H, W = obs.shape[:2]
-    p1_units  = []
-    p2_units  = []
-    resources = []
+    p1_units  = []   # (r, c, utype, cell_idx)
+    p2_units  = []   # (r, c, utype, cell_idx)
+    resources = []   # (r, c)
 
     for r in range(H):
         for c in range(W):
-            cell = obs[r, c]
+            cell  = obs[r, c]
             owner = _owner(cell)
             utype = _utype(cell)
+            idx   = r * W + c
             if owner == OWNER_P1:
-                p1_units.append((r, c, utype))
+                p1_units.append((r, c, utype, idx))
             elif owner == OWNER_P2:
-                p2_units.append((r, c, utype))
+                p2_units.append((r, c, utype, idx))
             elif utype == UT_RESOURCE:
                 resources.append((r, c))
 
     return {
+        "H": H, "W": W,
         "p1_units":  p1_units,
         "p2_units":  p2_units,
         "resources": resources,
-        "H": H,
-        "W": W,
+        "n_workers":  sum(1 for u in p1_units if u[2] == UT_WORKER),
+        "n_barracks": sum(1 for u in p1_units if u[2] == UT_BARRACK),
+        "n_bases":    sum(1 for u in p1_units if u[2] == UT_BASE),
+        "n_light":    sum(1 for u in p1_units if u[2] == UT_LIGHT),
+        "n_heavy":    sum(1 for u in p1_units if u[2] == UT_HEAVY),
+        "n_ranged":   sum(1 for u in p1_units if u[2] == UT_RANGED),
+        "n_combat":   sum(1 for u in p1_units if u[2] in (UT_LIGHT, UT_HEAVY, UT_RANGED)),
+        "enemy_pos":  [(r, c) for (r, c, _, _) in p2_units],
     }
 
-
 # ──────────────────────────────────────────────────────────────
-# Core decision function for a single unit in one environment
+# Per-unit decision logic
 # ──────────────────────────────────────────────────────────────
 
-def _decide_unit(
-    r: int, c: int,
-    cell: np.ndarray,
-    mask78: np.ndarray,
-    env_info: dict,
-) -> np.ndarray:
+def _decide(r, c, cell, mask78, env_info, worker_role):
     """
-    Returns a 7-element action vector for the unit at (r,c).
-    Elements: [action_type, move_dir, harvest_dir, return_dir,
-               produce_dir, produce_type, attack_flat_idx]
+    worker_role: 'harvest', 'build', or 'attack'
+    Returns a 7-element action array.
     """
-    act_mask  = mask78[MASK_ACT]
-    move_mask = mask78[MASK_MOVE]
-    harv_mask = mask78[MASK_HARV]
-    ret_mask  = mask78[MASK_RET]
-    prod_mask = mask78[MASK_PROD]
+    act_mask   = mask78[MASK_ACT]
+    move_mask  = mask78[MASK_MOVE]
+    harv_mask  = mask78[MASK_HARV]
+    ret_mask   = mask78[MASK_RET]
+    prod_mask  = mask78[MASK_PROD]
     ptype_mask = mask78[MASK_PTYPE]
-    atk_mask  = mask78[MASK_ATK]
+    atk_mask   = mask78[MASK_ATK]
 
-    utype    = _utype(cell)
-    cur_act  = _cur_action(cell)
-    H, W     = env_info["H"], env_info["W"]
-    p1_units = env_info["p1_units"]
-    p2_units = env_info["p2_units"]
-    resources= env_info["resources"]
+    utype      = _utype(cell)
+    p1_units   = env_info["p1_units"]
+    p2_units   = env_info["p2_units"]
+    resources  = env_info["resources"]
+    enemy_pos  = env_info["enemy_pos"]
+    n_workers  = env_info["n_workers"]
+    n_barracks = env_info["n_barracks"]
+    n_combat   = env_info["n_combat"]
 
-    # Counts
-    n_workers  = sum(1 for (_, _, t) in p1_units if t == UT_WORKER)
-    n_barracks = sum(1 for (_, _, t) in p1_units if t == UT_BARRACK)
-    n_combat   = sum(1 for (_, _, t) in p1_units if t in (UT_LIGHT, UT_HEAVY, UT_RANGED))
-    n_bases    = sum(1 for (_, _, t) in p1_units if t == UT_BASE)
+    bases   = [(br, bc) for (br, bc, bt, _) in p1_units if bt == UT_BASE]
 
-    enemy_positions = [(er, ec) for (er, ec, _) in p2_units]
+    # ── No non-NOOP actions available → NOOP ─────────────────
+    if not act_mask[1:].any():
+        return _noop()
 
-    # Default action vector
-    action = np.array([ACT_NOOP, 0, 0, 0, 0, PT_WORKER, 0], dtype=np.int32)
+    # ════════════════════════════════════════════════════════════
+    # BASE: produce workers
+    # ════════════════════════════════════════════════════════════
+    if utype == UT_BASE:
+        if act_mask[ACT_PRODUCE] and prod_mask.any() and ptype_mask[PT_WORKER]:
+            # Spawn away from nearest enemy
+            pref = DIR_S
+            if enemy_pos:
+                nearest_e = min(enemy_pos, key=lambda ep: _l1(r, c, ep[0], ep[1]))
+                # opposite direction from enemy
+                opp = _dir_toward(nearest_e[0], nearest_e[1], r, c)
+                if prod_mask[opp]:
+                    pref = opp
+            d = _first_valid_dir(prod_mask, pref)
+            return _make_produce(d, PT_WORKER)
+        return _noop()
 
-    # ── Helper: move toward target ──────────────────────────────
-    def move_toward(tr, tc):
-        if not act_mask[ACT_MOVE]:
-            return None
-        pref = _dir_toward(r, c, tr, tc)
-        d = _best_valid_dir(move_mask, pref)
-        return np.array([ACT_MOVE, d, 0, 0, 0, 0, 0], dtype=np.int32)
+    # ════════════════════════════════════════════════════════════
+    # BARRACK: produce combat units (light / ranged mix)
+    # ════════════════════════════════════════════════════════════
+    if utype == UT_BARRACK:
+        if act_mask[ACT_PRODUCE] and prod_mask.any():
+            # Prefer ranged, then light, then heavy
+            n_ranged = env_info["n_ranged"]
+            n_light  = env_info["n_light"]
+            choice   = None
+            if ptype_mask[PT_RANGED] and n_ranged <= n_light:
+                choice = PT_RANGED
+            elif ptype_mask[PT_LIGHT]:
+                choice = PT_LIGHT
+            elif ptype_mask[PT_HEAVY]:
+                choice = PT_HEAVY
+            elif ptype_mask[PT_RANGED]:
+                choice = PT_RANGED
 
-    def attack_nearest():
-        """Try to attack; if can't, move toward nearest enemy."""
-        if act_mask[ACT_ATTACK] and atk_mask.any():
-            tgt = _best_attack_target(atk_mask, r, c, enemy_positions, H, W)
-            return np.array([ACT_ATTACK, 0, 0, 0, 0, 0, tgt], dtype=np.int32)
-        if enemy_positions and act_mask[ACT_MOVE] and move_mask.any():
-            nearest = min(enemy_positions, key=lambda ep: _l1(r, c, ep[0], ep[1]))
-            return move_toward(nearest[0], nearest[1])
-        return None
+            if choice is not None:
+                # Produce toward nearest enemy (they'll come out facing the fight)
+                pref = DIR_S
+                if enemy_pos:
+                    nearest_e = min(enemy_pos, key=lambda ep: _l1(r, c, ep[0], ep[1]))
+                    pref = _dir_toward(r, c, nearest_e[0], nearest_e[1])
+                d = _first_valid_dir(prod_mask, pref)
+                return _make_produce(d, choice)
+        return _noop()
 
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # ════════════════════════════════════════════════════════════
     # WORKER logic
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # ════════════════════════════════════════════════════════════
     if utype == UT_WORKER:
-        carrying = _resources(cell) > 0
-        # If currently mid-harvest or mid-return, let it continue (NOOP for busy)
-        # (env handles this; if mask says only NOOP valid, we NOOP)
-        if not any(act_mask[1:]):  # only NOOP valid
-            return action  # NOOP
+        carrying = _res(cell) > 0
 
+        # ── If carrying resources, return to base ─────────────
         if carrying:
-            # Return resources to base
             if act_mask[ACT_RETURN] and ret_mask.any():
-                pref = 0
-                bases = [(br, bc) for (br, bc, bt) in p1_units if bt == UT_BASE]
+                pref = DIR_N
                 if bases:
-                    nearest_base = min(bases, key=lambda b: _l1(r, c, b[0], b[1]))
-                    pref = _dir_toward(r, c, nearest_base[0], nearest_base[1])
-                d = _best_valid_dir(ret_mask, pref)
-                return np.array([ACT_RETURN, 0, 0, d, 0, 0, 0], dtype=np.int32)
-            # Can't return directly, move toward base
-            bases = [(br, bc) for (br, bc, bt) in p1_units if bt == UT_BASE]
+                    nb = min(bases, key=lambda b: _l1(r, c, b[0], b[1]))
+                    pref = _dir_toward(r, c, nb[0], nb[1])
+                d = _first_valid_dir(ret_mask, pref)
+                return _make_return(d)
+            # Can't return directly — move toward base
             if bases and act_mask[ACT_MOVE] and move_mask.any():
-                nearest_base = min(bases, key=lambda b: _l1(r, c, b[0], b[1]))
-                mv = move_toward(nearest_base[0], nearest_base[1])
+                nb = min(bases, key=lambda b: _l1(r, c, b[0], b[1]))
+                mv = _move_toward(r, c, nb[0], nb[1], move_mask)
                 if mv is not None:
                     return mv
-        else:
-            # Harvest minerals
-            if resources:
-                nearest_res = min(resources, key=lambda res: _l1(r, c, res[0], res[1]))
-                dist = _l1(r, c, nearest_res[0], nearest_res[1])
-                if dist == 1 and act_mask[ACT_HARVEST] and harv_mask.any():
-                    pref = _dir_toward(r, c, nearest_res[0], nearest_res[1])
-                    d = _best_valid_dir(harv_mask, pref)
-                    return np.array([ACT_HARVEST, 0, d, 0, 0, 0, 0], dtype=np.int32)
-                elif act_mask[ACT_MOVE] and move_mask.any():
-                    mv = move_toward(nearest_res[0], nearest_res[1])
-                    if mv is not None:
-                        return mv
+            return _noop()
 
-        # If we have enemies and no resources to harvest, fight
-        if n_combat == 0 and enemy_positions:
-            atk = attack_nearest()
+        # ── Worker role: BUILD (if no barracks) ───────────────
+        if worker_role == 'build' or (n_barracks == 0 and act_mask[ACT_PRODUCE] and prod_mask.any() and ptype_mask[PT_BARRACK]):
+            if act_mask[ACT_PRODUCE] and prod_mask.any() and ptype_mask[PT_BARRACK]:
+                # Build barracks in any free adjacent cell
+                # Prefer direction away from enemies and toward center
+                H, W = env_info["H"], env_info["W"]
+                pref = _dir_toward(r, c, H // 2, W // 2)
+                d = _first_valid_dir(prod_mask, pref)
+                return _make_produce(d, PT_BARRACK)
+            # Can't build yet — move to find a free spot, or harvest for now
+            # Fall through to harvest logic
+
+        # ── Worker role: ATTACK (emergency / rush) ────────────
+        if worker_role == 'attack' and enemy_pos:
+            atk = _attack_or_move(r, c, mask78, enemy_pos)
             if atk is not None:
                 return atk
 
-        return action  # NOOP
+        # ── Default: HARVEST ──────────────────────────────────
+        if resources:
+            nearest_res = min(resources, key=lambda res: _l1(r, c, res[0], res[1]))
+            dist = _l1(r, c, nearest_res[0], nearest_res[1])
 
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # BASE logic
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    if utype == UT_BASE:
-        if not act_mask[ACT_PRODUCE] or not prod_mask.any():
-            return action  # busy or can't produce
+            if dist == 1 and act_mask[ACT_HARVEST] and harv_mask.any():
+                pref = _dir_toward(r, c, nearest_res[0], nearest_res[1])
+                d = _first_valid_dir(harv_mask, pref)
+                return _make_harvest(d)
 
-        # Priority: produce workers first if < 2, else keep at ≤3
-        if n_workers < 2 and ptype_mask[PT_WORKER]:
-            d = _best_valid_dir(prod_mask, DIR_S)
-            # prefer direction away from enemies
-            if enemy_positions:
-                enemy_avg_r = np.mean([ep[0] for ep in enemy_positions])
-                enemy_avg_c = np.mean([ep[1] for ep in enemy_positions])
-                away_r = r - (enemy_avg_r - r)
-                away_c = c - (enemy_avg_c - c)
-                pref = _dir_toward(r, c, away_r, away_c)
-                if prod_mask[pref]:
-                    d = pref
-            return np.array([ACT_PRODUCE, d, 0, 0, d, PT_WORKER, 0], dtype=np.int32)
+            if act_mask[ACT_MOVE] and move_mask.any():
+                mv = _move_toward(r, c, nearest_res[0], nearest_res[1], move_mask)
+                if mv is not None:
+                    return mv
 
-        # If no barracks and enough workers, produce barracks
-        if n_barracks == 0 and n_workers >= 2 and ptype_mask[PT_BARRACK]:
-            d = _best_valid_dir(prod_mask, DIR_E)
-            return np.array([ACT_PRODUCE, d, 0, 0, d, PT_BARRACK, 0], dtype=np.int32)
+        # No resources — if enemies exist, attack-move as last resort
+        if enemy_pos:
+            atk = _attack_or_move(r, c, mask78, enemy_pos)
+            if atk is not None:
+                return atk
 
-        # Otherwise produce more workers (up to 3)
-        if n_workers < 3 and ptype_mask[PT_WORKER]:
-            d = _best_valid_dir(prod_mask, DIR_S)
-            return np.array([ACT_PRODUCE, d, 0, 0, d, PT_WORKER, 0], dtype=np.int32)
+        return _noop()
 
-        return action
-
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # BARRACKS logic
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    if utype == UT_BARRACK:
-        if not act_mask[ACT_PRODUCE] or not prod_mask.any():
-            return action
-
-        # Produce mix: prefer ranged if possible, then light, then heavy
-        # Strategy: keep ranged:light roughly 1:1, fill heavy as needed
-        n_ranged = sum(1 for (_, _, t) in p1_units if t == UT_RANGED)
-        n_light  = sum(1 for (_, _, t) in p1_units if t == UT_LIGHT)
-        n_heavy  = sum(1 for (_, _, t) in p1_units if t == UT_HEAVY)
-
-        unit_choice = PT_LIGHT  # default
-        if ptype_mask[PT_RANGED] and n_ranged <= n_light:
-            unit_choice = PT_RANGED
-        elif ptype_mask[PT_LIGHT]:
-            unit_choice = PT_LIGHT
-        elif ptype_mask[PT_HEAVY]:
-            unit_choice = PT_HEAVY
-
-        if ptype_mask[unit_choice]:
-            # Produce toward enemies
-            d = DIR_S
-            if enemy_positions:
-                nearest_enemy = min(enemy_positions, key=lambda ep: _l1(r, c, ep[0], ep[1]))
-                pref = _dir_toward(r, c, nearest_enemy[0], nearest_enemy[1])
-                d = _best_valid_dir(prod_mask, pref)
-            else:
-                d = _best_valid_dir(prod_mask, DIR_S)
-            return np.array([ACT_PRODUCE, d, 0, 0, d, unit_choice, 0], dtype=np.int32)
-
-        return action
-
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # COMBAT UNIT logic (light, heavy, ranged)
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # ════════════════════════════════════════════════════════════
+    # COMBAT UNITS (light, heavy, ranged)
+    # ════════════════════════════════════════════════════════════
     if utype in (UT_LIGHT, UT_HEAVY, UT_RANGED):
-        atk = attack_nearest()
+        atk = _attack_or_move(r, c, mask78, enemy_pos)
         if atk is not None:
             return atk
-        return action  # NOOP if no enemy in range and can't move
+        return _noop()
 
-    # RESOURCE NODES – always NOOP
-    return action
+    # Everything else (resources, etc.) → NOOP
+    return _noop()
 
 
 # ──────────────────────────────────────────────────────────────
-# Main policy function
+# Worker role assignment
+# ──────────────────────────────────────────────────────────────
+
+def _assign_worker_roles(env_info):
+    """
+    Returns a dict mapping (r, c) -> role string for workers.
+
+    Roles:
+      'build'   — designated builder (builds barracks)
+      'harvest' — primary resource gatherer
+      'attack'  — worker rush or emergency defense
+    """
+    workers = [(r, c, idx) for (r, c, t, idx) in env_info["p1_units"] if t == UT_WORKER]
+    n_barracks = env_info["n_barracks"]
+    n_combat   = env_info["n_combat"]
+    enemy_pos  = env_info["enemy_pos"]
+    resources  = env_info["resources"]
+    roles = {}
+
+    if not workers:
+        return roles
+
+    # Sort workers by cell index for stable assignment
+    workers_sorted = sorted(workers, key=lambda w: w[2])
+
+    if n_barracks == 0:
+        # First worker builds, rest harvest
+        roles[(workers_sorted[0][0], workers_sorted[0][1])] = 'build'
+        for w in workers_sorted[1:]:
+            roles[(w[0], w[1])] = 'harvest'
+    elif not resources:
+        # No resources to harvest — all attack-move
+        for w in workers_sorted:
+            roles[(w[0], w[1])] = 'attack'
+    elif n_combat == 0 and enemy_pos and len(workers_sorted) >= 2:
+        # No military at all — rush with spare workers, keep one harvesting
+        roles[(workers_sorted[0][0], workers_sorted[0][1])] = 'harvest'
+        for w in workers_sorted[1:]:
+            roles[(w[0], w[1])] = 'attack'
+    else:
+        # Normal: all workers harvest
+        for w in workers_sorted:
+            roles[(w[0], w[1])] = 'harvest'
+
+    return roles
+
+
+# ──────────────────────────────────────────────────────────────
+# Main policy
 # ──────────────────────────────────────────────────────────────
 
 def policy(observation: np.ndarray, action_mask: np.ndarray) -> np.ndarray:
@@ -453,45 +432,45 @@ def policy(observation: np.ndarray, action_mask: np.ndarray) -> np.ndarray:
     -------
     actions : np.ndarray  shape (num_envs, H*W, 7)
     """
-    num_envs   = observation.shape[0]
-    H, W       = observation.shape[1], observation.shape[2]
-    map_size   = H * W
+    num_envs = observation.shape[0]
+    H, W     = observation.shape[1], observation.shape[2]
+    map_size = H * W
 
-    # Output buffer
     actions = np.zeros((num_envs, map_size, 7), dtype=np.int32)
 
     for env_idx in range(num_envs):
         obs_e    = observation[env_idx]   # (H, W, 29)
         mask_e   = action_mask[env_idx]   # (H*W, 78)
-        env_info = _parse_env(obs_e)
+
+        env_info     = _parse_env(obs_e)
+        worker_roles = _assign_worker_roles(env_info)
 
         for cell_idx in range(map_size):
             r = cell_idx // W
             c = cell_idx  % W
-            cell   = obs_e[r, c]     # (29,)
-            mask78 = mask_e[cell_idx] # (78,)
+            cell   = obs_e[r, c]
+            mask78 = mask_e[cell_idx]
 
-            # Only act if this cell has at least one non-NOOP action valid
-            # and is owned by player 1
-            owner = _owner(cell)
-            if owner != OWNER_P1:
-                # NOOP
-                actions[env_idx, cell_idx] = [ACT_NOOP, 0, 0, 0, 0, 0, 0]
+            # Skip cells not owned by player 1
+            if _owner(cell) != OWNER_P1:
                 continue
 
             act_mask = mask78[MASK_ACT]
             if not act_mask.any():
-                actions[env_idx, cell_idx] = [ACT_NOOP, 0, 0, 0, 0, 0, 0]
                 continue
 
-            unit_action = _decide_unit(r, c, cell, mask78, env_info)
+            utype = _utype(cell)
+            role  = worker_roles.get((r, c), 'harvest') if utype == UT_WORKER else 'n/a'
 
-            # Safety check: ensure chosen action_type is actually valid in mask.
-            # If not, fall back to first valid action type.
+            unit_action = _decide(r, c, cell, mask78, env_info, role)
+
+            # Safety: ensure chosen action_type is valid in mask
             chosen_at = unit_action[0]
             if not act_mask[chosen_at]:
                 valid_ats = np.where(act_mask)[0]
-                unit_action[0] = int(valid_ats[0]) if len(valid_ats) > 0 else ACT_NOOP
+                unit_action = _noop()
+                if len(valid_ats) and valid_ats[0] != ACT_NOOP:
+                    unit_action[0] = int(valid_ats[0])
 
             actions[env_idx, cell_idx] = unit_action
 
